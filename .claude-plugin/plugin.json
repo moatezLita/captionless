@@ -1,0 +1,12 @@
+{
+  "name": "captionless",
+  "description": "Transcribe any YouTube video, playlist, or media file, even with no captions, then summarize, search, translate, or subtitle it. Works with a free Groq key, OpenAI, Gemini, or fully offline.",
+  "author": {
+    "name": "moatezLita",
+    "url": "https://github.com/moatezLita"
+  },
+  "homepage": "https://github.com/moatezLita/captionless",
+  "repository": "https://github.com/moatezLita/captionless",
+  "license": "MIT",
+  "keywords": ["youtube", "transcript", "transcription", "whisper", "subtitles", "captions", "speech-to-text"]
+}

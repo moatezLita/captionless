@@ -1,0 +1,15 @@
+{
+  "name": "captionless",
+  "description": "Transcribe any video, even with no captions, from Claude Code.",
+  "owner": {
+    "name": "moatezLita",
+    "url": "https://github.com/moatezLita"
+  },
+  "plugins": [
+    {
+      "name": "captionless",
+      "source": "./",
+      "description": "Transcribe any YouTube video, playlist, or media file, even with no captions, then summarize, search, translate, or subtitle it."
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# Installed automatically into ~/.captionless/venv on the first run.
+# Listed here for people who prefer to manage their own environment.
+yt-dlp[default]
+av
+numpy
+requests
+# Only for --provider local:
+# faster-whisper
