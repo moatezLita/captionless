@@ -5,6 +5,9 @@ Usage:
   captionless.py <url-or-file> [...] [options]   transcribe (the default command)
   captionless.py search "words" [options]        search every saved transcript
   captionless.py fix [folder]                    re-apply corrections.txt to saved transcripts
+  captionless.py export [folder]                 make Markdown and WebVTT copies of saved transcripts
+  captionless.py watch add|list|remove|run       transcribe the new videos of channels and playlists
+  captionless.py mcp                             run as an MCP server (Claude Desktop, Cursor, ...)
   captionless.py doctor                          check the setup
   captionless.py update                          upgrade the downloader (fixes most download errors)
 
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import hashlib
 import html
 import importlib
@@ -34,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = Path(os.environ.get("CAPTIONLESS_HOME") or (Path.home() / ".captionless"))
 VENV = HOME / "venv"
@@ -60,11 +64,12 @@ PROVIDERS = {
 }
 AUTO_ORDER = ("groq", "openai", "gemini")
 
-NO_KEY_HELP = f"""No speech-to-text API key found. captionless needs one of:
-  Groq (free, no card)   https://console.groq.com/keys          GROQ_API_KEY
-  OpenAI                 https://platform.openai.com/api-keys   OPENAI_API_KEY
-  Google Gemini          https://aistudio.google.com/apikey     GEMINI_API_KEY
-Set the variable in your environment, or add a line such as GROQ_API_KEY=your-key to
+NO_KEY_HELP = f"""No speech-to-text API key found. Set the key of whichever service you use:
+  GROQ_API_KEY     Groq (has a free tier)            https://console.groq.com/keys
+  OPENAI_API_KEY   OpenAI                            https://platform.openai.com/api-keys
+  GEMINI_API_KEY   Google Gemini (has a free tier)   https://aistudio.google.com/apikey
+For another OpenAI-compatible server, set CAPTIONLESS_BASE_URL (and CAPTIONLESS_API_KEY if it needs one).
+Set the variable in your environment, or add it as a line (NAME=your-key) to
 {HOME / 'config.env'}
 To run offline with no key at all, add: --provider local"""
 
@@ -106,8 +111,13 @@ class QuotaError(Exception):
     """The provider's rate limit will not clear within --max-wait."""
 
 
+_LOG_SINK = None   # the MCP server points this at the running job so it can report progress
+
+
 def log(msg=""):
     print(msg, file=sys.stderr, flush=True)
+    if _LOG_SINK and str(msg).strip():
+        _LOG_SINK(str(msg).strip())
 
 
 # --------------------------------------------------------------------------- settings
@@ -364,6 +374,63 @@ def paragraphs(segments, target=45.0, hard_max=90.0):
     return paras
 
 
+def chapter_blocks(segments, chapters):
+    """[(chapter title or None, paragraphs)]: the video's own chapters become sections of the transcript."""
+    if not chapters:
+        return [(None, paragraphs(segments))]
+    starts, groups = [c[0] for c in chapters], {}
+    for s in segments:   # a segment belongs to the chapter that is running at its midpoint
+        groups.setdefault(bisect.bisect_right(starts, (s["start"] + s["end"]) / 2) - 1, []).append(s)
+    return [(chapters[i][1] if i >= 0 else None, paragraphs(groups[i])) for i in sorted(groups)]
+
+
+EXTRA_FILES = {"vtt": "subtitles.vtt", "md": "transcript.md"}
+
+
+def parse_formats(value):
+    """'md,vtt' -> {'md', 'vtt'}: the optional extra files (transcript.txt and subtitles.srt are always written)."""
+    wanted = {x.strip().lower().lstrip(".") for x in re.split(r"[,\s]+", value or "") if x.strip()}
+    wanted -= {"txt", "srt"}
+    unknown = wanted - set(EXTRA_FILES)
+    if unknown:
+        raise UserError(f"Unknown format '{sorted(unknown)[0]}'. The extra formats are: {', '.join(EXTRA_FILES)}.")
+    return wanted
+
+
+def write_extras(folder, formats=()):
+    """Make the asked-for extra files from the two saved ones, and refresh any that already exist.
+
+    subtitles.vtt is the WebVTT twin of subtitles.srt. transcript.md is transcript.txt as Markdown,
+    with chapter headings and (for YouTube) timestamps that open the video at that moment.
+    """
+    formats = set(formats) | {k for k, name in EXTRA_FILES.items() if (folder / name).is_file()}
+    srt, txt, made = folder / "subtitles.srt", folder / "transcript.txt", []
+    if "vtt" in formats and srt.is_file():
+        lines = [ln.replace(",", ".") if "-->" in ln else ln for ln in srt.read_text(encoding="utf-8").split("\n")]
+        (folder / EXTRA_FILES["vtt"]).write_text("WEBVTT\n\n" + "\n".join(lines), encoding="utf-8")
+        made.append(folder / EXTRA_FILES["vtt"])
+    if "md" in formats and txt.is_file():
+        meta = read_header(txt)
+        head, sep, body = txt.read_text(encoding="utf-8").partition(SEPARATOR)
+        source = meta.get("source", "")
+        out = [f"# {meta.get('title') or folder.name}", ""]
+        out += [f"- **{k.capitalize()}:** {meta[k]}"
+                for k in ("source", "channel", "duration", "language", "engine", "created") if meta.get(k)]
+        out.append("")
+        for line in (body if sep else head).strip("\n").splitlines():
+            m = re.match(r"\[(?:(\d+):)?(\d+):(\d+)\]\s*(.*)", line)
+            if m:
+                secs = int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                stamp = f"[{fmt_ts(secs)}]"
+                if youtube_id(source):
+                    stamp += f"({time_link(source, secs)})"
+                line = f"**{stamp}** {m.group(4)}"
+            out.append(line)
+        (folder / EXTRA_FILES["md"]).write_text("\n".join(out) + "\n", encoding="utf-8")
+        made.append(folder / EXTRA_FILES["md"])
+    return made
+
+
 def write_outputs(segments, meta, out_dir, done, timestamps=True):
     """Saves <out>/<channel>/<title> [id]/transcript.txt and subtitles.srt."""
     folder = done.get(meta["id"]) if meta.get("id") else None
@@ -386,8 +453,11 @@ def write_outputs(segments, meta, out_dir, done, timestamps=True):
                f"Created:  {time.strftime('%Y-%m-%d')}",
                SEPARATOR, ""]
     body = []
-    for start, text in paragraphs(segments):
-        body += [f"[{fmt_ts(start)}] {text}" if timestamps else text, ""]
+    for chapter, paras in chapter_blocks(segments, meta.get("chapters")):
+        if chapter:
+            body += [f"## {chapter}", ""]
+        for start, text in paras:
+            body += [f"[{fmt_ts(start)}] {text}" if timestamps else text, ""]
     txt = folder / "transcript.txt"
     txt.write_text("\n".join(header + body), encoding="utf-8")
 
@@ -444,12 +514,13 @@ def download_error(e):
     return UserError(msg)
 
 
-def expand_playlist(url, args):
+def expand_playlist(url, args, **extra):
     """Every video of a playlist or channel as (title, [items])."""
     import yt_dlp
 
+    first, last = getattr(args, "start", 1), getattr(args, "end", 0)
     try:
-        with yt_dlp.YoutubeDL(ydl_options(args, noplaylist=False, extract_flat="in_playlist")) as ydl:
+        with yt_dlp.YoutubeDL(ydl_options(args, noplaylist=False, extract_flat="in_playlist", **extra)) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
         raise download_error(e)
@@ -465,7 +536,7 @@ def expand_playlist(url, args):
             entries.append(e)
     items = []
     for n, e in enumerate(entries, 1):
-        if n < args.start or (args.end and n > args.end):
+        if n < first or (last and n > last):
             continue
         link = e.get("url") or e.get("webpage_url")
         if not link and e.get("id"):
@@ -951,6 +1022,10 @@ def process(item, args, ctx):
                     meta = dict(kind="url", id=info.get("id"), title=info.get("title") or info.get("id") or "video",
                                 source=info.get("webpage_url") or item["value"], duration=info.get("duration"),
                                 channel=info.get("channel") or info.get("uploader"))
+                    chapters = sorted((float(c.get("start_time") or 0), str(c["title"]).strip())
+                                      for c in info.get("chapters") or [] if str(c.get("title") or "").strip())
+                    if len(chapters) > 1:
+                        meta["chapters"] = chapters
                     if meta["id"] in done and not args.force:
                         return done[meta["id"]], True
                     log(f"  {meta['title']}")
@@ -999,6 +1074,8 @@ def process(item, args, ctx):
         print(f"FOLDER:     {folder}")
         print(f"TRANSCRIPT: {folder / 'transcript.txt'}")
         print(f"SUBTITLES:  {folder / 'subtitles.srt'}")
+        for extra in write_extras(folder, ctx.get("formats") or ()):
+            print(f"ALSO:       {extra}")
         print(f"ENGINE:     {meta['engine']}")
         if not segments:
             print("WARNING:    no speech was found in this audio")
@@ -1010,12 +1087,21 @@ def process(item, args, ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def cmd_transcribe(argv):
+def transcribe_parser(prog="captionless", description=None, inputs=True):
+    """The options shared by every command that transcribes (`watch run` takes them without the links)."""
     ap = argparse.ArgumentParser(
-        prog="captionless",
-        description="Transcribe online videos (no captions needed) or local audio/video files.",
-        epilog="Other commands: search, fix, doctor, update. Run `captionless.py <command> --help`.")
-    ap.add_argument("inputs", nargs="+", help="video links, playlist links, or local media files")
+        prog=prog,
+        description=description or "Transcribe online videos (no captions needed) or local audio/video files.",
+        epilog="Other commands: search, fix, export, watch, mcp, doctor, update. "
+               "Run `captionless.py <command> --help`.")
+    if inputs:
+        ap.add_argument("inputs", nargs="+", help="video links, playlist links, or local media files")
+        ap.add_argument("--playlist", action="store_true", help="transcribe every video of the playlist or channel")
+        ap.add_argument("--from", dest="start", type=int, default=1, metavar="N", help="first playlist position")
+        ap.add_argument("--to", dest="end", type=int, default=0, metavar="N", help="last playlist position")
+        ap.add_argument("--force", action="store_true", help="redo videos that already have a transcript")
+    else:
+        ap.set_defaults(playlist=False, start=1, end=0, force=False)
     ap.add_argument("-l", "--lang", help="spoken language code such as en, es, ar, ja (default: detected)")
     ap.add_argument("-p", "--provider", choices=["auto", *PROVIDERS],
                     help="speech-to-text service (default: the first one with an API key)")
@@ -1025,11 +1111,10 @@ def cmd_transcribe(argv):
     ap.add_argument("--captions", choices=["manual", "any", "never"], default="manual",
                     help="reuse existing captions instead of AI: manual = only ones the uploader made (default), "
                          "any = also automatic captions, never = always transcribe")
-    ap.add_argument("--playlist", action="store_true", help="transcribe every video of the playlist or channel")
-    ap.add_argument("--from", dest="start", type=int, default=1, metavar="N", help="first playlist position")
-    ap.add_argument("--to", dest="end", type=int, default=0, metavar="N", help="last playlist position")
     ap.add_argument("--limit", type=int, default=0, metavar="N", help="stop after N new transcripts")
-    ap.add_argument("--force", action="store_true", help="redo videos that already have a transcript")
+    ap.add_argument("--formats", metavar="LIST",
+                    help="extra files to write next to transcript.txt and subtitles.srt: md (Markdown with "
+                         "clickable timestamps), vtt (WebVTT subtitles), or both as md,vtt")
     ap.add_argument("--prompt", help="names or terms to spell correctly (use sparingly: a bad hint hurts accuracy)")
     ap.add_argument("--chunk-minutes", type=float, default=10, metavar="M", help="length of each piece sent")
     ap.add_argument("--max-wait", type=int, default=900, metavar="SEC",
@@ -1039,19 +1124,27 @@ def cmd_transcribe(argv):
     ap.add_argument("--no-timestamps", action="store_true", help="leave [mm:ss] markers out of transcript.txt")
     ap.add_argument("--cookies-from-browser", metavar="BROWSER",
                     help="use this browser's login (chrome, edge, firefox, safari) for restricted videos")
-    args = ap.parse_args(argv)
-    if not 1 <= args.chunk_minutes <= 20:
-        ap.error("--chunk-minutes must be between 1 and 20")
+    return ap
 
+
+def prepare(args):
+    """What every transcribing command does first: check the options and the packages. Returns the output folder."""
+    if not 1 <= args.chunk_minutes <= 20:
+        raise UserError("--chunk-minutes must be between 1 and 20")
+    args.formats = parse_formats(args.formats if args.formats is not None else setting("CAPTIONLESS_FORMATS"))
     wants_local = (args.provider or setting("CAPTIONLESS_PROVIDER") or "").lower() == "local"
     ensure_deps(local=wants_local)
-    out_dir = Path(args.out).expanduser() if args.out else default_out()
     cache_root = HOME / "cache"
     if cache_root.is_dir():   # forget unfinished runs older than a week
         for d in cache_root.iterdir():
             if d.is_dir() and time.time() - d.stat().st_mtime > 7 * 86400:
                 shutil.rmtree(d, ignore_errors=True)
+    return Path(args.out).expanduser() if args.out else default_out()
 
+
+def cmd_transcribe(argv):
+    args = transcribe_parser().parse_args(argv)
+    out_dir = prepare(args)
     items = []
     for inp in args.inputs:
         if os.path.isfile(inp):
@@ -1063,8 +1156,12 @@ def cmd_transcribe(argv):
             items += found
         else:
             items.append(dict(kind="url", value=inp, id=youtube_id(inp), title=None))
+    return run_items(items, args, out_dir)[0]
 
-    ctx = dict(out=out_dir, done=scan_done(out_dir), provider=None, local={})
+
+def run_items(items, args, out_dir):
+    """Transcribe a list of videos and files one after another. Returns (exit code, failed items)."""
+    ctx = dict(out=out_dir, done=scan_done(out_dir), provider=None, local={}, formats=args.formats)
     new = skipped = 0
     failures, stopped, limited = [], None, None
     for n, item in enumerate(items, 1):
@@ -1089,7 +1186,7 @@ def cmd_transcribe(argv):
         except Exception as e:  # noqa: BLE001 - one bad video must not end a playlist run
             msg = str(e).strip() or e.__class__.__name__
             log("  FAILED: " + msg)
-            failures.append((item.get("title") or item["value"], msg.splitlines()[0]))
+            failures.append((item, msg.splitlines()[0]))
             continue
         if was_done:
             skipped += 1
@@ -1101,14 +1198,14 @@ def cmd_transcribe(argv):
     sys.stdout.flush()
     if len(items) > 1 or stopped or failures:
         log(f"\n{new} transcribed, {skipped} already done, {len(failures)} failed.")
-    for title, msg in failures:
-        log(f"  failed: {title}: {msg}")
+    for item, msg in failures:
+        log(f"  failed: {item.get('title') or item['value']}: {msg}")
     if limited:
         log(f"{limited} Run the same command again to continue; finished videos are skipped.")
     if stopped:
         log(f"STOPPED: {stopped} Run the same command again to continue; finished videos are skipped.")
-        return 2
-    return 1 if failures else 0
+        return 2, failures
+    return (1 if failures else 0), failures
 
 
 # --------------------------------------------------------------------------- command: search
@@ -1162,12 +1259,18 @@ def cmd_search(argv):
     ap.add_argument("-o", "--out", help="transcripts folder")
     args = ap.parse_args(argv)
     out_dir = Path(args.out).expanduser() if args.out else default_out()
-    phrase = normalize(" ".join(args.query))
+    print(search_library(out_dir, " ".join(args.query), args.channel, args.limit))
+    return 0
+
+
+def search_library(out_dir, query, channel=None, limit=20):
+    """The search results as text: each one names the video, the moment, a link, and the passage."""
+    phrase = normalize(query)
     terms = phrase.split()
     hits = []
     for txt in sorted(out_dir.glob("*/*/transcript.txt")):
         folder = txt.parent
-        if args.channel and normalize(args.channel) not in normalize(folder.parent.name):
+        if channel and normalize(channel) not in normalize(folder.parent.name):
             continue
         cues = read_cues(folder)
         norm = [normalize(t) for _, t in cues]
@@ -1185,18 +1288,17 @@ def cmd_search(argv):
             else:
                 i += 1
     hits.sort(key=lambda h: h[0])   # exact phrase first, otherwise library order
-    if not hits:
-        print(f'No matches for "{" ".join(args.query)}" in {out_dir}')
-        return 0
-    print(f'{len(hits)} match(es) for "{" ".join(args.query)}"' +
-          (f", showing the first {args.limit}" if len(hits) > args.limit else "") + "\n")
-    for n, (_, meta, start, snippet, txt) in enumerate(hits[:args.limit], 1):
+    if not hits or not terms:
+        return f'No matches for "{query}" in {out_dir}'
+    out = [f'{len(hits)} match(es) for "{query}"' + (f", showing the first {limit}" if len(hits) > limit else ""),
+           ""]
+    for n, (_, meta, start, snippet, txt) in enumerate(hits[:limit], 1):
         title = meta.get("title", txt.parent.name)
-        print(f"[{n}] {title}" + (f"  ({meta['channel']})" if meta.get("channel") else ""))
-        print(f"    {fmt_ts(start)}  {time_link(meta.get('source'), start)}")
-        print(f"    {snippet[:400]}{'...' if len(snippet) > 400 else ''}")
-        print(f"    {txt}\n")
-    return 0
+        out += [f"[{n}] {title}" + (f"  ({meta['channel']})" if meta.get("channel") else ""),
+                f"    {fmt_ts(start)}  {time_link(meta.get('source'), start)}",
+                f"    {snippet[:400]}{'...' if len(snippet) > 400 else ''}",
+                f"    {txt}", ""]
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- commands: fix, doctor, update
@@ -1234,9 +1336,167 @@ def cmd_fix(argv):
                 touched = True
         if touched:
             changed += 1
+            write_extras(folder)   # keep transcript.md and subtitles.vtt, where they exist, in step
             print(f"fixed: {folder}")
     print(f"{changed} transcript(s) updated.")
     return 0
+
+
+def cmd_export(argv):
+    ap = argparse.ArgumentParser(
+        prog="captionless export",
+        description="Make extra copies of transcripts that are already saved, without transcribing again: "
+                    "transcript.md (Markdown with clickable timestamps, for Obsidian, Notion and the like) "
+                    "and subtitles.vtt (WebVTT, for web players).")
+    ap.add_argument("folder", nargs="?", help="a channel or video folder (default: the whole library)")
+    ap.add_argument("--formats", default="md,vtt", metavar="LIST", help="md, vtt, or md,vtt (default: both)")
+    ap.add_argument("-o", "--out", help="transcripts folder")
+    args = ap.parse_args(argv)
+    formats = parse_formats(args.formats)
+    out_dir = Path(args.out).expanduser() if args.out else default_out()
+    target = Path(args.folder).expanduser() if args.folder else out_dir
+    count = 0
+    for txt in sorted(target.rglob("transcript.txt")):
+        if write_extras(txt.parent, formats):
+            count += 1
+            print(f"exported: {txt.parent}")
+    print(f"{count} transcript(s) exported as {', '.join(sorted(formats)) or 'nothing'}.")
+    return 0
+
+
+# --------------------------------------------------------------------------- command: watch
+
+WATCH_DEPTH = 50   # how many of a channel's newest videos are looked at on each check
+YT_CHANNEL = re.compile(r"(https?://(?:www\.|m\.)?youtube\.com/(?:@[^/?#]+|(?:channel|c|user)/[^/?#]+))/?(?:[?#].*)?$")
+
+
+def watch_file():
+    return HOME / "watch.json"
+
+
+def load_watch():
+    f = watch_file()
+    if not f.is_file():
+        return []
+    try:
+        return json.loads(f.read_text(encoding="utf-8")).get("sources", [])
+    except (ValueError, AttributeError):
+        raise UserError(f"{f} is damaged. Fix it or delete it, then add your channels again.")
+
+
+def save_watch(sources):
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = watch_file().with_suffix(".tmp")
+    tmp.write_text(json.dumps({"sources": sources}, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(watch_file())
+
+
+def watch_listing(url, args):
+    """What is behind a watched link right now: a whole playlist, or a channel's newest videos (newest first)."""
+    channel = YT_CHANNEL.match(url)
+    if channel:
+        url = channel.group(1) + "/videos"
+    is_list = bool(re.search(r"[?&]list=", url))
+    title, items = expand_playlist(url, args, **({} if is_list else {"playlistend": WATCH_DEPTH}))
+    if title is None:
+        raise UserError("This link is a single video. Watching works on a channel or a playlist link.")
+    return re.sub(r" - Videos$", "", title), [i for i in items if i.get("id")], not is_list
+
+
+def cmd_watch(argv):
+    usage = ("captionless watch add <channel or playlist link> [...]   start watching; videos already there are "
+             "left alone\n"
+             "       captionless watch list                                    show what is watched\n"
+             "       captionless watch remove <number or link>                 stop watching\n"
+             "       captionless watch run [transcribe options]                transcribe what is new since the "
+             "last check")
+    sub, rest = (argv[0] if argv else ""), argv[1:]
+    if sub == "run":
+        ap = transcribe_parser("captionless watch run", inputs=False,
+                               description="Transcribe every video that appeared on the watched channels and "
+                                           "playlists since the last check. Schedule this command (cron, Task "
+                                           "Scheduler) to keep a library up to date on its own.")
+        return watch_run(ap.parse_args(rest))
+    ap = argparse.ArgumentParser(prog="captionless watch", usage=usage,
+                                 description="Follow channels and playlists, and transcribe their new videos.")
+    ap.add_argument("action", choices=["add", "list", "remove"])
+    ap.add_argument("targets", nargs="*", help="links to add, or the number or link to remove")
+    ap.add_argument("--cookies-from-browser", metavar="BROWSER", help="use this browser's login for the check")
+    args = ap.parse_args(argv)
+    sources = load_watch()
+    if args.action == "list":
+        if not sources:
+            print("Nothing is being watched. Add a channel or playlist: captionless.py watch add <link>")
+        for n, s in enumerate(sources, 1):
+            print(f"[{n}] {s['title']}\n    {s['url']}\n    added {s.get('added', '?')}, "
+                  f"last checked {s.get('checked') or 'never'}")
+        return 0
+    if not args.targets:
+        ap.error(f"`watch {args.action}` needs a link" + (" or a number" if args.action == "remove" else ""))
+    if args.action == "remove":
+        for t in args.targets:
+            hit = next((s for n, s in enumerate(sources, 1) if t == str(n) or t == s["url"]), None)
+            if not hit:
+                raise UserError(f"'{t}' is not in the watch list. See it with: captionless.py watch list")
+            sources = [s for s in sources if s is not hit]
+            print(f"REMOVED: {hit['title']}")
+        save_watch(sources)
+        return 0
+    ensure_deps()
+    for url in args.targets:
+        if any(s["url"] == url for s in sources):
+            print(f"ALREADY WATCHED: {url}")
+            continue
+        title, items, _ = watch_listing(url, args)
+        sources.append(dict(url=url, title=title, added=time.strftime("%Y-%m-%d"), checked=None,
+                            seen=[i["id"] for i in items], failed={}))
+        save_watch(sources)
+        print(f"WATCHING: {title}  ({len(items)} video(s) already there are left alone; "
+              "`watch run` transcribes what appears from now on)")
+    return 0
+
+
+def watch_run(args):
+    sources = load_watch()
+    if not sources:
+        print("Nothing is being watched. Add a channel or playlist: captionless.py watch add <link>")
+        return 0
+    out_dir = prepare(args)
+    done, items, fresh_by_source, unreachable = scan_done(out_dir), [], [], 0
+    for s in sources:
+        try:
+            title, listed, newest_first = watch_listing(s["url"], args)
+        except UserError as e:
+            log(f"Could not check {s['title']}: {str(e).splitlines()[0]}")
+            fresh_by_source.append([])
+            unreachable += 1
+            continue
+        seen = set(s["seen"])
+        fresh = [i for i in listed if i["id"] not in seen]
+        todo = [i for i in fresh if i["id"] not in done]
+        if newest_first:
+            todo.reverse()   # oldest of the new ones first, the order they came out in
+        s["checked"] = time.strftime("%Y-%m-%d %H:%M")
+        fresh_by_source.append(fresh)
+        items += [i for i in todo if i["id"] not in {x["id"] for x in items}]
+        print(f"NEW: {len(todo)} in {title}")
+    code, failures = run_items(items, args, out_dir) if items else (0, [])
+    not_yet = re.compile(r"Premieres? in|will begin in|live (stream|event)", re.IGNORECASE)   # these come later
+    done, failed_ids = scan_done(out_dir), {item["id"] for item, msg in failures if not not_yet.search(msg)}
+    for s, fresh in zip(sources, fresh_by_source):
+        fails = s.setdefault("failed", {})
+        for i in fresh:
+            if i["id"] in failed_ids:
+                fails[i["id"]] = fails.get(i["id"], 0) + 1
+            if i["id"] in done or fails.get(i["id"], 0) >= 3:   # done, or failing every time: stop trying
+                if i["id"] not in done:
+                    log(f"Giving up on {i.get('title') or i['id']} after 3 failed attempts.")
+                s["seen"].append(i["id"])
+                fails.pop(i["id"], None)
+    save_watch(sources)
+    if not items:
+        print("No new videos.")
+    return code or (1 if unreachable else 0)
 
 
 def cmd_doctor(argv):
@@ -1268,6 +1528,10 @@ def cmd_doctor(argv):
     print(f"Output       {out_dir}  ({count} transcript(s))")
     cfg = HOME / "config.env"
     print(f"Config file  {cfg}  ({'found' if cfg.is_file() else 'not created'})")
+    try:
+        print(f"Watching     {len(load_watch())} channel(s) or playlist(s)")
+    except UserError as e:
+        print(f"Watching     {e}")
     return 0
 
 
@@ -1278,16 +1542,303 @@ def cmd_update(argv):
     r = subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--upgrade",
                         "yt-dlp[default]"], stdout=sys.stderr)
     if r.returncode:
-        raise UserError("The upgrade failed; see the pip messages above.")
+        raise UserError("The upgrade failed; see the pip messages above. If you installed captionless with pipx "
+                        "or uv, upgrade it there instead: `pipx upgrade captionless` or `uv tool upgrade captionless`.")
     v = subprocess.run([str(py), "-c", "import yt_dlp.version as v; print(v.__version__)"],
                        capture_output=True, text=True).stdout.strip()
     print(f"yt-dlp is up to date ({v}).")
     return 0
 
 
+# --------------------------------------------------------------------------- command: mcp
+#
+# A small Model Context Protocol server over stdin/stdout, so that apps without a terminal
+# (Claude Desktop, Cursor, ...) can use the same library. It speaks plain JSON-RPC and needs no extra package.
+
+MCP_VERSIONS = ("2025-06-18", "2025-11-25", "2025-03-26", "2024-11-05")
+MCP_CHUNK = 30000   # characters of transcript returned per call; the rest is read with read_transcript
+MCP_GUIDE = (
+    "captionless turns a video into text, even when the video has no captions, and keeps every transcript in a "
+    "folder on the user's computer. After `transcribe`, read the text and do what the user asked (by default: a "
+    "short overview, the main topics with their timestamps, and the key takeaways), then save what you wrote "
+    "with `save_note` so it sits next to the transcript. Speech recognition makes mistakes, mostly in names, "
+    "rare words and quotations: say so when it matters, and ask the user to check scripture, legal or medical "
+    "wording and exact quotes against a reliable source. Never ask the user to type an API key into the chat; "
+    "keys belong in the environment or in the config file that the error message names.")
+MCP_TOOLS = [
+    {"name": "transcribe",
+     "description": "Transcribe one online video (YouTube and most other sites) or a media file on this computer, "
+                    "even when it has no captions. Saves the transcript and subtitles in the user's library and "
+                    "returns the text with [mm:ss] timestamps. A video that is already in the library is returned "
+                    "at once. Long videos take a few minutes: if the answer says the work is still running, wait "
+                    "about 30 seconds and call this tool again with the same arguments to collect the result.",
+     "inputSchema": {"type": "object", "required": ["source"], "properties": {
+         "source": {"type": "string", "description": "The video link, or the full path of an audio/video file."},
+         "language": {"type": "string", "description": "Spoken language code such as en, es, ar, ja. Leave it "
+                                                       "out to detect the language; set it only if the user "
+                                                       "names the language or the result came out wrong."},
+         "translate": {"type": "boolean", "description": "Write the transcript in English, whatever is spoken."},
+         "force": {"type": "boolean", "description": "Transcribe again even if the video is already saved."}}}},
+    {"name": "read_transcript",
+     "description": "Read a saved transcript, or the next part of a long one.",
+     "inputSchema": {"type": "object", "required": ["video"], "properties": {
+         "video": {"type": "string", "description": "The video id, part of its title, or its folder path."},
+         "offset": {"type": "integer", "description": "Character position to start from (default 0). The "
+                                                      "previous part tells you the next offset."}}}},
+    {"name": "search_transcripts",
+     "description": "Find where something was said, across every saved transcript. All the words must appear "
+                    "close together. It ignores case, accents and Arabic spelling variants but matches words, not "
+                    "meaning, so try a few likely wordings in the language of the videos. Each result has a "
+                    "timestamp and a link to that moment.",
+     "inputSchema": {"type": "object", "required": ["query"], "properties": {
+         "query": {"type": "string", "description": "Words to find."},
+         "channel": {"type": "string", "description": "Only search channels whose name contains this text."},
+         "limit": {"type": "integer", "description": "Most results to return (default 10)."}}}},
+    {"name": "list_transcripts",
+     "description": "List the videos in the user's transcript library, newest first.",
+     "inputSchema": {"type": "object", "properties": {
+         "channel": {"type": "string", "description": "Only channels whose name contains this text."},
+         "limit": {"type": "integer", "description": "Most videos to list (default 30)."}}}},
+    {"name": "save_note",
+     "description": "Save something you wrote about a video (a summary, notes, a translation, translated "
+                    "subtitles) as a file in that video's folder, next to its transcript.",
+     "inputSchema": {"type": "object", "required": ["video", "filename", "content"], "properties": {
+         "video": {"type": "string", "description": "The video id, part of its title, or its folder path."},
+         "filename": {"type": "string", "description": "A plain file name ending in .md, .txt, .srt or .vtt, for "
+                                                       "example summary.md or subtitles.fr.srt."},
+         "content": {"type": "string", "description": "The text of the file."}}}},
+]
+
+
+def find_video(out_dir, ref):
+    """The folder of a saved video, named by its id, its folder path, or part of its title."""
+    ref = str(ref or "").strip()
+    if not ref:
+        raise UserError("Say which video: its id, part of its title, or its folder path.")
+    if (Path(ref) / "transcript.txt").is_file():
+        return Path(ref)
+    done = scan_done(out_dir)
+    if ref in done:
+        return done[ref]
+    if youtube_id(ref) in done:
+        return done[youtube_id(ref)]
+    want = normalize(ref)
+    hits = [t.parent for t in out_dir.glob("*/*/transcript.txt") if want in normalize(t.parent.name)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise UserError(f"No saved transcript matches '{ref}'. Use list_transcripts to see what is saved.")
+    raise UserError(f"'{ref}' matches {len(hits)} videos; use the id in square brackets:\n"
+                    + "\n".join(f"- {h.name}" for h in hits[:15]))
+
+
+def transcript_part(folder, offset=0):
+    """The header and one part of a transcript, with a pointer to the next part when there is one."""
+    txt = folder / "transcript.txt"
+    head, sep, body = txt.read_text(encoding="utf-8").partition(SEPARATOR)
+    if not sep:
+        head, body = "", head
+    body = body.strip("\n")
+    offset = max(0, min(int(offset or 0), len(body)))
+    end = min(len(body), offset + MCP_CHUNK)
+    if end < len(body):   # stop at the end of a paragraph
+        cut = body.rfind("\n\n", offset, end)
+        end = cut if cut > offset else end
+    lines = [head.strip(), f"Folder:   {folder}"]
+    m = re.search(r"\[([^\[\]]+)\]$", folder.name)
+    if m:
+        lines.append(f"Video id: {m.group(1)}")
+    others = sorted(p.name for p in folder.iterdir() if p.is_file() and p.name != "transcript.txt")
+    if others:
+        lines.append(f"Files:    transcript.txt, {', '.join(others)}")
+    if offset or end < len(body):
+        lines.append(f"Showing characters {offset}-{end} of {len(body)}.")
+    lines += [SEPARATOR, "", body[offset:end].strip("\n")]
+    if end < len(body):
+        ref = m.group(1) if m else str(folder)
+        lines += ["", f'[There is more. Call read_transcript with video="{ref}" and offset={end}.]']
+    return "\n".join(x for x in lines if x is not None)
+
+
+_MCP_JOBS, _MCP_LOCK, _MCP_ONE_AT_A_TIME = {}, threading.Lock(), threading.Lock()
+
+
+def mcp_transcribe(a, progress):
+    """Start (or rejoin) a transcription and wait a while for it; long ones are collected with a second call."""
+    source = str(a.get("source") or "").strip()
+    if not source:
+        raise UserError("`source` is needed: a video link or a file path.")
+    key = (source, a.get("language") or "", bool(a.get("translate")))
+    with _MCP_LOCK:
+        job = _MCP_JOBS.get(key)
+        if job is None:
+            job = _MCP_JOBS[key] = dict(done=threading.Event(), last="waiting to start", text=None, error=None)
+
+            def work():
+                global _LOG_SINK
+                with _MCP_ONE_AT_A_TIME:   # one video at a time keeps within the providers' rate limits
+                    _LOG_SINK = lambda msg: job.update(last=msg)   # noqa: E731
+                    try:
+                        argv = [source] + (["--lang", str(a["language"])] if a.get("language") else []) \
+                            + (["--translate"] if a.get("translate") else []) + (["--force"] if a.get("force") else [])
+                        args = transcribe_parser().parse_args(argv)
+                        out_dir = prepare(args)
+                        if os.path.isfile(source):
+                            item = dict(kind="file", value=source, id=None, title=Path(source).name)
+                        else:
+                            item = dict(kind="url", value=source, id=youtube_id(source), title=None)
+                        ctx = dict(out=out_dir, done=scan_done(out_dir), provider=None, local={}, formats=args.formats)
+                        folder, was_done = process(item, args, ctx)
+                        text = transcript_part(folder)
+                        if looks_unreliable(text.partition(SEPARATOR)[2]):
+                            text = ("WARNING: this transcript looks unreliable (repeated letters). Call transcribe "
+                                    "again with force=true before using it.\n\n") + text
+                        job["text"] = ("Already in the library.\n\n" if was_done else "Transcribed.\n\n") + text
+                    except QuotaError as e:
+                        job["error"] = (f"{e} The finished pieces are saved, so calling transcribe again later "
+                                        "continues where this stopped.")
+                    except BaseException as e:  # noqa: BLE001 - the job must always report back
+                        msg = str(e).strip() or e.__class__.__name__
+                        if "playlist or channel" in msg:
+                            msg = "This link is a playlist or channel. Give one video link at a time."
+                        job["error"] = "Setup is incomplete; run `captionless doctor` in a terminal." \
+                            if isinstance(e, SystemExit) else msg
+                    finally:
+                        _LOG_SINK = None
+                        job["done"].set()
+
+            threading.Thread(target=work, daemon=True).start()
+    deadline, n = time.time() + float(setting("CAPTIONLESS_MCP_WAIT") or 50), 0
+    while not job["done"].wait(5) and time.time() < deadline:
+        n += 1
+        progress(n, job["last"])
+    if not job["done"].is_set():
+        return (f"Still working ({job['last']}). The transcription continues in the background. Wait about 30 "
+                "seconds, then call transcribe again with the same arguments to collect the result.")
+    with _MCP_LOCK:
+        _MCP_JOBS.pop(key, None)
+    if job["error"]:
+        raise UserError(job["error"])
+    return job["text"]
+
+
+def mcp_call(name, a, progress):
+    out_dir = default_out()
+    if name == "transcribe":
+        return mcp_transcribe(a, progress)
+    if name == "read_transcript":
+        return transcript_part(find_video(out_dir, a.get("video")), a.get("offset") or 0)
+    if name == "search_transcripts":
+        if not str(a.get("query") or "").strip():
+            raise UserError("`query` is needed: the words to find.")
+        return search_library(out_dir, str(a["query"]), a.get("channel"), int(a.get("limit") or 10))
+    if name == "list_transcripts":
+        found = [t for t in out_dir.glob("*/*/transcript.txt")
+                 if not a.get("channel") or normalize(str(a["channel"])) in normalize(t.parent.parent.name)]
+        found.sort(key=lambda t: t.stat().st_mtime, reverse=True)
+        limit = int(a.get("limit") or 30)
+        lines = [f"{len(found)} transcript(s) in {out_dir}" + (f", newest {limit} shown" if len(found) > limit else "")]
+        for t in found[:limit]:
+            meta = read_header(t)
+            m = re.search(r"\[([^\[\]]+)\]$", t.parent.name)
+            lines.append(f"- {meta.get('title') or t.parent.name} | {meta.get('channel') or t.parent.parent.name} | "
+                         f"{meta.get('duration', '?')} | saved {meta.get('created', '?')}"
+                         + (f" | id: {m.group(1)}" if m else f" | folder: {t.parent}"))
+        return "\n".join(lines)
+    if name == "save_note":
+        folder, fname = find_video(out_dir, a.get("video")), str(a.get("filename") or "").strip()
+        if not re.fullmatch(r"\w[\w .\-]{0,80}\.(md|txt|srt|vtt)", fname) or \
+                fname.lower() in ("transcript.txt", "subtitles.srt"):
+            raise UserError("`filename` must be a plain name ending in .md, .txt, .srt or .vtt (for example "
+                            "summary.md), and may not replace transcript.txt or subtitles.srt.")
+        (folder / fname).write_text(str(a.get("content") or ""), encoding="utf-8")
+        return f"Saved {folder / fname}"
+    raise UserError(f"Unknown tool: {name}")
+
+
+def cmd_mcp(argv):
+    argparse.ArgumentParser(
+        prog="captionless mcp",
+        description="Run as an MCP server on stdin/stdout. An app such as Claude Desktop starts this command "
+                    "itself; see the README for the few lines to add to its settings.").parse_args(argv)
+    ensure_deps()
+    # The protocol owns the two pipes this program was started with, through private copies of them.
+    # Everything else that prints (this script, the downloader, child programs) is moved to stderr, where
+    # the app keeps it as a log, and everything else that looks at stdin finds an empty one. That matters
+    # on Windows: while this program waits for the next message, anything else touching the same pipe freezes.
+    sys.stdout.flush()
+    wire, inbox = os.fdopen(os.dup(1), "wb"), os.fdopen(os.dup(0), "rb")
+    os.dup2(2, 1)
+    nul = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nul, 0)
+    os.close(nul)
+    sys.stdout = sys.stderr
+    lock = threading.Lock()
+
+    def send(obj):
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8", "replace")
+        with lock:
+            wire.write(data)
+            wire.flush()
+
+    def call_tool(mid, params):
+        token = (params.get("_meta") or {}).get("progressToken")
+
+        def progress(n, message):
+            if token is not None:
+                send({"jsonrpc": "2.0", "method": "notifications/progress",
+                      "params": {"progressToken": token, "progress": n, "message": message}})
+
+        try:
+            text, failed = mcp_call(params.get("name"), params.get("arguments") or {}, progress), False
+        except UserError as e:
+            text, failed = str(e), True
+        except Exception as e:  # noqa: BLE001 - a tool error is an answer, not a crash
+            text, failed = f"{e.__class__.__name__}: {e}", True
+        send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text}],
+                                                      "isError": failed}})
+
+    def handle(msg):
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if method is None or mid is None:
+            return   # replies and notifications need no answer
+        if method == "initialize":
+            asked = params.get("protocolVersion")
+            result = {"protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
+                      "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "captionless", "version": __version__},
+                      "instructions": MCP_GUIDE}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": MCP_TOOLS}
+        elif method == "tools/call":
+            threading.Thread(target=call_tool, args=(mid, params), daemon=True).start()
+            return
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Method not found: {method}"}})
+            return
+        send({"jsonrpc": "2.0", "id": mid, "result": result})
+
+    log(f"captionless {__version__} MCP server ready; transcripts in {default_out()}")
+    for raw in iter(inbox.readline, b""):
+        if not raw.strip():
+            continue
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+            continue
+        for m in msg if isinstance(msg, list) else [msg]:
+            if isinstance(m, dict):
+                handle(m)
+    return 0
+
+
 # --------------------------------------------------------------------------- entry point
 
-COMMANDS = {"search": cmd_search, "fix": cmd_fix, "doctor": cmd_doctor, "update": cmd_update}
+COMMANDS = {"search": cmd_search, "fix": cmd_fix, "export": cmd_export, "watch": cmd_watch, "mcp": cmd_mcp,
+            "doctor": cmd_doctor, "update": cmd_update}
 
 
 def main():
@@ -1297,6 +1848,9 @@ def main():
         except (AttributeError, ValueError):
             pass
     argv = sys.argv[1:]
+    if sys.version_info < (3, 11):   # the video downloader no longer supports older versions
+        log(f"ERROR: captionless needs Python 3.11 or newer; this is Python {sys.version.split()[0]}.")
+        return 1
     if argv and argv[0] in ("-V", "--version"):
         print(f"captionless {__version__}")
         return 0

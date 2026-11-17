@@ -32,8 +32,10 @@ Request: `$ARGUMENTS`
    SUBTITLES:  .../subtitles.srt
    ENGINE:     what produced the text
    ```
-   A `WARNING:` line means the result is suspect. Read the transcript before trusting it, and if it is mostly repeated letters or syllables, run again with `--force` rather than summarizing nonsense.
+   An `ALSO:` line names each extra file that was written (see "Other formats"). A `WARNING:` line means the result is suspect. Read the transcript before trusting it, and if it is mostly repeated letters or syllables, run again with `--force` rather than summarizing nonsense.
 3. Read `transcript.txt` (in parts, for long ones), then do what the user asked.
+
+When the video has chapters, they appear in `transcript.txt` as `## Chapter title` lines above the paragraphs they cover. Use them as the outline of your summary.
 
 If the video has captions written by its uploader, the script uses those and skips the AI step; `ENGINE` says so. `--captions any` also accepts automatic captions (instant, but less accurate), and `--captions never` always transcribes.
 
@@ -43,6 +45,7 @@ Save what you write in the video's folder, next to the transcript, so the user's
 
 - **No specific request:** write `summary.md` — a two- or three-sentence overview, a table of topics with timestamps, and the key takeaways — then give a short version in your reply along with the folder path.
 - **A specific request** (notes, quotes, an article, action items, a translation): produce that from the transcript, save it as a fitting file such as `notes.md`, and show it in your reply.
+- **A clean reading version** ("make it readable", "add punctuation", "fix the paragraphs"): write `reading.md` in the video's folder. Keep the speaker's words and their order exactly; add only punctuation, paragraph breaks, and the chapter headings, and keep one `[mm:ss]` timestamp at the start of each paragraph. Don't summarize, translate, or drop repetitions. Where a word is clearly a recognition error, correct it and list those corrections at the end of the file so the user can check them. Work through a long transcript in parts so nothing is skipped. This matters most for languages that Whisper writes without punctuation, such as Arabic.
 - **The transcript itself:** paste it if they ask for the text. Otherwise point to the file; an hour of speech is too long to read in a chat.
 
 Make timestamps clickable when the source is YouTube: `[12:35](https://www.youtube.com/watch?v=VIDEO_ID&t=755s)`, with the time in seconds.
@@ -57,6 +60,31 @@ Add `--playlist` to transcribe every video behind a playlist or channel link. Wi
 - Finished videos are skipped, so the same command can be run again and again until the list is done.
 - Exit code 2 with a `STOPPED:` line means the provider's rate limit was reached. Nothing is lost: tell the user how long the wait is (the message says) and that running the same command later continues where it stopped. `--max-wait <seconds>` makes the script sit out longer pauses on its own.
 - Long playlists take a while. Run them in the background and tell the user what you started, rather than writing a summary for every video unless they ask for that.
+
+## Follow a channel or playlist
+
+When the user wants new videos transcribed as they come out ("watch this channel", "keep up with this playlist"):
+
+```
+captionless.py watch add "<channel or playlist link>"     start watching; videos already there are left alone
+captionless.py watch run                                  transcribe what appeared since the last check
+captionless.py watch list
+captionless.py watch remove <number or link>
+```
+
+- `watch add` transcribes nothing. To also get older videos, use `--playlist` with `--limit` or `--from/--to` as above.
+- `watch run` prints one `NEW: <count> in <name>` line per source, then the usual lines for each video it transcribes. It accepts the transcribe options (`--lang`, `--limit`, `--formats`, ...). Run it in the background when several videos are new, and tell the user what came in.
+- A channel link looks at the channel's newest 50 uploads on each check; a playlist link looks at the whole list.
+- It runs only when someone runs it. If the user wants it to happen by itself, offer to schedule `watch run` (cron on macOS and Linux, Task Scheduler on Windows); the README has the commands.
+
+## Other formats
+
+`transcript.txt` and `subtitles.srt` are always written. Two more are optional:
+
+- `transcript.md`: Markdown with chapter headings and timestamps that link to the moment in the video, for note apps such as Obsidian and Notion.
+- `subtitles.vtt`: WebVTT, the subtitle format web players use.
+
+Add `--formats md`, `--formats vtt` or `--formats md,vtt` when transcribing. For videos that are already saved, `captionless.py export [folder] --formats md,vtt` makes the files without transcribing again. If the user always wants them, suggest the line `CAPTIONLESS_FORMATS=md,vtt` in `~/.captionless/config.env`.
 
 ## Translated subtitles
 
@@ -85,12 +113,13 @@ When the same name or term keeps coming out wrong for a channel, or the user cor
 Jon Doe => John Doe
 ```
 
-A `corrections.txt` in the top transcripts folder applies to every channel. New transcripts pick the rules up automatically. Run `captionless.py fix` to apply them to transcripts that are already saved.
+A `corrections.txt` in the top transcripts folder applies to every channel. New transcripts pick the rules up automatically. Run `captionless.py fix` to apply them to transcripts that are already saved; it also updates `transcript.md` and `subtitles.vtt` where those exist.
 
 ## Setup and problems
 
-- **No API key yet:** the script prints the choices and where to get each key. Pass that on to the user. Groq is free and needs no card. Ask them to set the variable themselves, in their environment or in `~/.captionless/config.env`; a key pasted into the chat ends up in the conversation history, so don't ask for it there.
+- **No API key yet:** the script prints the choices and where to get each key. Pass that on to the user and let them choose; if they ask for a free option, Groq and Gemini have free tiers and `--provider local` needs no key. Ask them to set the variable themselves, in their environment or in `~/.captionless/config.env`; a key pasted into the chat ends up in the conversation history, so don't ask for it there.
 - **Check the setup:** `captionless.py doctor` shows which providers have keys, whether a JavaScript runtime was found (YouTube downloads need Deno or Node 20+), and where transcripts are saved.
+- **"captionless needs Python 3.11 or newer":** the user has to install a newer Python; the script cannot work around it.
 - **Download errors that mention the site, formats, or signatures:** run `captionless.py update`, then try again. Video sites change often and the downloader has to keep up.
 - **"Sign in to confirm you're not a bot", or age-restricted videos:** add `--cookies-from-browser chrome` (or `edge`, `firefox`, `safari`).
 - **Another provider or model:** `--provider groq|openai|gemini|custom|local` and `--model <name>`. `--provider local` runs offline with no key; it is slower and downloads a model the first time.

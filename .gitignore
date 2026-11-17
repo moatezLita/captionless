@@ -6,3 +6,6 @@ venv/
 config.env
 *.log
 .DS_Store
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,43 @@
+# Lets captionless be installed as a command:
+#   pipx install git+https://github.com/moatezLita/captionless
+#   uvx --from git+https://github.com/moatezLita/captionless captionless <link>
+# The whole tool is the one script in skills/transcribe/scripts, which the Claude Code plugin runs directly.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "captionless"
+dynamic = ["version"]
+description = "Transcribe any YouTube video, playlist, or media file, even with no captions. Bring your own speech-to-text key or run offline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "moatezLita" }]
+keywords = ["youtube", "transcript", "transcription", "whisper", "subtitles", "speech-to-text", "mcp", "claude"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = ["yt-dlp[default]", "av", "numpy", "requests"]
+
+[project.optional-dependencies]
+local = ["faster-whisper"]
+
+[project.scripts]
+captionless = "captionless:main"
+
+[project.urls]
+Homepage = "https://github.com/moatezLita/captionless"
+Issues = "https://github.com/moatezLita/captionless/issues"
+
+[tool.setuptools]
+package-dir = { "" = "skills/transcribe/scripts" }
+py-modules = ["captionless"]
+
+[tool.setuptools.dynamic]
+version = { attr = "captionless.__version__" }

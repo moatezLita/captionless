@@ -1,6 +1,6 @@
 {
   "name": "captionless",
-  "description": "Transcribe any video, even with no captions, from Claude Code.",
+  "description": "Transcribe any video, even with no captions.",
   "owner": {
     "name": "moatezLita",
     "url": "https://github.com/moatezLita"
